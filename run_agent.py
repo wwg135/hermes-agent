@@ -9697,7 +9697,46 @@ class AIAgent:
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
-                    
+                    else:
+                        # Provider returned no usage data in the response
+                        # (e.g. MiniMax via OpenRouter ignores stream_options.
+                        # include_usage).  Fall back to rough estimation so
+                        # sessions don't record 0/0 tokens permanently.
+                        # Fixes #12023.
+                        _est_in = estimate_messages_tokens_rough(messages)
+                        _est_out = estimate_tokens_rough(
+                            (response.choices[0].message.content or "")
+                            if response.choices else ""
+                        )
+                        _est_total = _est_in + _est_out
+                        logger.warning(
+                            "No usage data in response for model=%s provider=%s "
+                            "— using rough estimates (in≈%d, out≈%d)",
+                            self.model, self.provider or "unknown",
+                            _est_in, _est_out,
+                        )
+                        self.context_compressor.update_from_response({
+                            "prompt_tokens": _est_in,
+                            "completion_tokens": _est_out,
+                            "total_tokens": _est_total,
+                        })
+                        self.session_prompt_tokens += _est_in
+                        self.session_completion_tokens += _est_out
+                        self.session_total_tokens += _est_total
+                        self.session_api_calls += 1
+                        self.session_input_tokens += _est_in
+                        self.session_output_tokens += _est_out
+                        if self._session_db and self.session_id:
+                            try:
+                                self._session_db.update_token_counts(
+                                    self.session_id,
+                                    input_tokens=_est_in,
+                                    output_tokens=_est_out,
+                                    model=self.model,
+                                )
+                            except Exception:
+                                pass  # never block the agent loop
+
                     has_retried_429 = False  # Reset on success
                     # Clear Nous rate limit state on successful request —
                     # proves the limit has reset and other sessions can
@@ -11064,10 +11103,16 @@ class AIAgent:
                     # should_compress(0) never fires.  (#2153)
                     _compressor = self.context_compressor
                     if _compressor.last_prompt_tokens > 0:
-                        _real_tokens = (
-                            _compressor.last_prompt_tokens
-                            + _compressor.last_completion_tokens
-                        )
+                        # Use only prompt tokens for the compression check.
+                        # Completion tokens (especially reasoning tokens from
+                        # thinking models like GLM-5.1, QwQ, DeepSeek-R1) are
+                        # ephemeral output — they don't consume context window
+                        # space for the next API call.  Including them caused
+                        # premature compression for reasoning models: e.g.
+                        # 85K prompt + 20K completion (15K reasoning) = 105K,
+                        # exceeding a 101K threshold despite only 42% context
+                        # usage.  Fixes #12026.
+                        _real_tokens = _compressor.last_prompt_tokens
                     else:
                         _real_tokens = estimate_messages_tokens_rough(messages)
 
